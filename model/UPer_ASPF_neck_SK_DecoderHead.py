@@ -5,8 +5,6 @@ from mmcv.cnn import ConvModule
 from mmseg.ops import resize
 from ..builder import HEADS
 from .decode_head import BaseDecodeHead
-from ..utils.embed import SKConv
-
 
 class ASPFModule(nn.ModuleList):
     """Atrous Spatial Pyramid Fusion (ASPF) Module.
@@ -49,6 +47,53 @@ class ASPFModule(nn.ModuleList):
 
         return aspf_outs
 
+    
+from functools import reduce
+class SKConv(nn.Module):
+    def __init__(self,in_channels,out_channels,stride=1,M=2,r=16,L=32):
+        super(SKConv,self).__init__()
+        d=max(in_channels//r,L)   
+        self.M=M
+        self.out_channels=out_channels
+        self.conv=nn.ModuleList()  
+        for i in range(M):
+            self.conv.append(nn.Sequential(nn.Conv2d(in_channels,out_channels,3,stride,padding=1+i,dilation=1+i,groups=32,bias=False), #groups=32
+                                           nn.BatchNorm2d(out_channels),
+                                           nn.ReLU(inplace=True)))
+        self.global_pool=nn.AdaptiveAvgPool2d(output_size = 1)
+        self.fc1=nn.Sequential(nn.Conv2d(out_channels,d,1,bias=False),
+                               nn.BatchNorm2d(d),
+                               nn.ReLU(inplace=True))   
+        self.fc2=nn.Conv2d(d,out_channels*M,1,1,bias=False) 
+        self.softmax=nn.Softmax(dim=1) 
+    def forward(self, input):
+        batch_size=input.size(0)
+        output=[]
+        #the part of split
+        for i,conv in enumerate(self.conv):
+            #print(i,conv(input).size())
+            output.append(conv(input))    #[batch_size,out_channels,H,W]
+        #the part of fusion
+        U=reduce(lambda x,y:x+y,output) #   [batch_size,channel,H,W]
+        # print(U.size())            
+        s=self.global_pool(U)     # [batch_size,channel,1,1]
+        # print(s.size())
+        z=self.fc1(s)  # S->Z   # [batch_size,d,1,1]
+        # print(z.size())
+        a_b=self.fc2(z) # Z->a，b  [batch_size,out_channels*M,1,1]
+        # print(a_b.size())
+        a_b=a_b.reshape(batch_size,self.M,self.out_channels,-1) #[batch_size,M,out_channels,1]  
+        # print(a_b.size())
+        a_b=self.softmax(a_b) # softmax [batch_size,M,out_channels,1]  
+        #the part of selection
+        a_b=list(a_b.chunk(self.M,dim=1))#split to a and b    [[batch_size,1,out_channels,1],[batch_size,1,out_channels,1]
+        # print(a_b[0].size())
+        # print(a_b[1].size())
+        a_b=list(map(lambda x:x.reshape(batch_size,self.out_channels,1,1),a_b)) # [[batch_size,out_channels,1,1],[batch_size,out_channels,1,1]
+        V=list(map(lambda x,y:x*y,output,a_b)) # [batch_size,out_channels,H,W] * [batch_size,out_channels,1,1] = [batch_size,out_channels,H,W]
+        V=reduce(lambda x,y:x+y,V) #   [batch_size,out_channels,H,W] + [batch_size,out_channels,H,W] = [batch_size,out_channels,H,W]
+        return V    # [batch_size,out_channels,H,W]
+    
 @HEADS.register_module()
 class UPerHeadASPFSK(BaseDecodeHead):
     """Unified Perceptual Parsing for Scene Understanding.
